@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
+from typing import List
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -7,24 +9,25 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
 
-# -----------------------------
-# Scrape SHL Catalog
-# -----------------------------
-def fetch_shl_catalog():
+class Recommendation(BaseModel):
+    name: str
+    url: str
+    remote: str
+    adaptive: str
+    score: float
+
+def fetch_shl_catalog() -> pd.DataFrame:
     url = "https://www.shl.com/solutions/products/product-catalog/"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-    except Exception as e:
-        print(f"Error fetching SHL catalog: {e}")
+    except Exception:
         return pd.DataFrame()
 
     soup = BeautifulSoup(response.text, "html.parser")
     products = []
-    product_tiles = soup.find_all("div", class_="custom__table-responsive")
-    if not product_tiles:
-        product_tiles = soup.find_all("li", class_="product-item")
 
+    product_tiles = soup.find_all("tr")
     for tile in product_tiles:
         anchor = tile.find("a", href=True)
         if anchor:
@@ -48,47 +51,30 @@ def fetch_shl_catalog():
 
     return pd.DataFrame(products)
 
-df_assessments = fetch_shl_catalog()
-if df_assessments.empty:
-    print("Warning: No data fetched from SHL.")
-
-# -----------------------------
-# Recommendation Logic
-# -----------------------------
-def recommend_assessments(query: str, df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+def recommend_assessments(query: str, df: pd.DataFrame, top_n: int = 10) -> List[Recommendation]:
     names = df["Assessment Name"].tolist()
-    corpus = [query] + names
     vec = TfidfVectorizer(stop_words="english")
-    tfidf = vec.fit_transform(corpus)
-    sims = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
+    name_vectors = vec.fit_transform(names)
+    query_vector = vec.transform([query])
+    sims = cosine_similarity(query_vector, name_vectors).flatten()
+    idx = sims.argsort()[::-1][:top_n]
+    result = df.iloc[idx].copy()
+    result["Score"] = sims[idx]
 
-    df_copy = df.copy()
-    df_copy["Score"] = sims
+    recommendations = []
+    for _, row in result.iterrows():
+        recommendations.append(Recommendation(
+            name=row["Assessment Name"],
+            url=row["URL"],
+            remote=row["Remote Testing Support"],
+            adaptive=row["Adaptive/IRT Support"],
+            score=round(float(row["Score"]), 4)
+        ))
+    return recommendations
 
-    # Always return top_n regardless of score
-    return df_copy.sort_values(by="Score", ascending=False).head(top_n)
-
-
-
-# -----------------------------
-# FastAPI Endpoint
-# -----------------------------
-@app.get("/query")
-def query_recommendations(q: str, top_n: int = 10):
-    if df_assessments.empty:
-        raise HTTPException(status_code=404, detail="No product data available")
-    try:
-        df_result = recommend_assessments(q, df_assessments, top_n=len(df_assessments))
-
-        # Add scores and sort
-        df_result = df_result.sort_values(by="Score", ascending=False)
-
-        # Keep only top_n
-        df_result = df_result.head(top_n)
-
-        results = df_result.drop(columns=["Score"]).to_dict(orient="records")
-        return {"results": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+@app.get("/recommend", response_model=List[Recommendation])
+def get_recommendations(query: str = Query(..., description="Job description or search text")):
+    df = fetch_shl_catalog()
+    if df.empty:
+        return []
+    return recommend_assessments(query, df)
